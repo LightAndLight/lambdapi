@@ -1,158 +1,145 @@
+{-# language DeriveFunctor, DeriveFoldable, DeriveTraversable, TemplateHaskell, FlexibleContexts #-}
 module AST where
 
+import Bound
+import Bound.Name
+import Bound.Scope
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Trans.Class
+import Data.Deriving
+import Data.Functor.Classes
+import Data.Functor.Identity
+import Text.Trifecta
 
 -- | Type : Type is unsound and needs to be reworked with universe polymorphism
-data Expr
-  = Ann Expr Expr
+data Expr n a
+  = Ann (Expr n a) (Expr n a)
   | Type
-  | Pi Expr Expr
-  | Bound Int
-  | Free Name
-  | App Expr Expr
-  | Lam Expr
-  deriving (Eq, Show)
+  | Pi n (Expr n a) (Scope (Name n ()) (Expr n) a)
+  | Var a
+  | App (Expr n a) (Expr n a)
+  | Lam n (Scope (Name n ()) (Expr n) a)
+  deriving (Functor, Foldable, Traversable)
 
-data Name
-  = Local Int
-  | Global String
-  | Quote Int
-  deriving (Eq, Show)
-
-printExpr :: Expr -> String
-printExpr = go [] (liftA2 (++) (pure <$> ['a'..'z']) (show <$> [1::Int ..]))
-  where
-    go mapping supply e =
-      case e of
-        Ann a b -> "(" ++ go mapping supply a ++ ") : (" ++ go mapping supply b ++ ")"
-        Type -> "Type"
-        Pi a b ->
-          case supply of
-            name : supply' ->
-              "pi (" ++ name ++ " : " ++ go mapping supply a ++ "). " ++
-              go (name : mapping) supply' b
-            _ -> error "printExpr: name supply exhausted"
-        Bound n -> mapping !! n
-        Free (Global name) -> name
-        Free a -> error "printExpr: unexpected " ++ show a ++ " in Free"
-        App f x -> "(" ++ go mapping supply f ++ ") (" ++ go mapping supply x ++ ")"
-        Lam a -> 
-          case supply of
-            name : supply' ->
-              "lam " ++ name ++ ". " ++
-              go (name : mapping) supply' a
-            _ -> error "printExpr: name supply exhausted"
-
-data TypeError
-  = TypeMismatch Expr Expr
-  | NotAFunction Expr Expr
-  | UnknownName Name
-  | NotAFunctionType Expr
-  | CannotInfer Expr
-  deriving (Eq, Show)
-
-data Neutral
-  = NVar Name
-  | NApp Neutral Value
-
-data Value
-  = VLam (Value -> Value)
-  | VPi Value (Value -> Value)
-  | VType
-  | VNeutral Neutral
-
-quote :: Int -> Value -> Expr
-quote binders v =
-  case v of
-    VLam f -> Lam . quote (binders+1) . f . VNeutral $ NVar $ Quote binders
-    VPi t f -> Pi (quote binders t) (quote (binders+1) . f . VNeutral $ NVar $ Quote binders)
-    VType -> Type
-    VNeutral n -> fromNeutral binders n
-  where
-    fromNeutral binders (NVar (Quote n)) = Bound $ binders - n - 1
-    fromNeutral binders (NVar n) = Free n
-    fromNeutral binders (NApp n v) = App (fromNeutral binders n) (quote binders v)
+instance Eq1 (Expr n) where
+  liftEq f (Ann a b) (Ann a' b') = liftEq f a a' && liftEq f b b'
+  liftEq _ Type Type = True
+  liftEq f (Pi _ a b) (Pi _ a' b') = liftEq f a a' && liftEq f b b'
+  liftEq f (Var a) (Var a') = f a a'
+  liftEq f (App a b) (App a' b') = liftEq f a a' && liftEq f b b'
+  liftEq f (Lam _ a) (Lam _ a') = liftEq f a a'
+  liftEq _ _ _ = False
   
-type Environment = [Value]
+deriveShow1 ''Expr
 
-eval :: Environment -> Expr -> Value
-eval ctxt expr =
+instance Applicative (Expr n) where
+  pure = return
+  (<*>) = ap
+
+instance Monad (Expr n) where
+  return = Var
+  
+  Ann a b >>= f = Ann (a >>= f) (b >>= f)
+  Type >>= _ = Type
+  Pi n a b >>= f = Pi n (a >>= f) (b >>>= f)
+  Var a >>= f = f a
+  App a b >>= f = App (a >>= f) (b >>= f)
+  Lam n a >>= f = Lam n (a >>>= f)
+
+instance Eq a => Eq (Expr n a) where
+  (==) = eq1
+  
+instance (Show n, Show a) => Show (Expr n a) where
+  showsPrec = showsPrec1
+
+lam :: Eq n => n -> Expr n n -> Expr n n
+lam n e = Lam n $ abstract1Name n e
+
+piType :: Eq n => n -> Expr n n -> Expr n n -> Expr n n
+piType n e e' = Pi n e $ abstract1Name n e'
+
+eval :: Expr n a -> Expr n a
+eval expr =
   case expr of
-    Ann e _ -> eval ctxt e
-    Type -> VType
-    Pi rho rho' -> VPi (eval ctxt rho) (\v -> eval (v : ctxt) rho')
-    Bound n -> ctxt !! n
-    Free name -> VNeutral $ NVar name
+    Ann e _ -> eval e
+    Type -> Type
+    Pi n rho rho' ->
+      let t = eval rho
+      in Pi n t (runIdentity $ transverseScope (Identity . eval) rho')
     App f x ->
-      case eval ctxt f of
-        VLam f' -> f' (eval ctxt x)
-        VNeutral f' -> VNeutral $ NApp f' (eval ctxt x)
+      case eval f of
+        Lam _ e -> eval $ instantiate1Name (eval x) e
         _ -> error "eval: value applied to non-function value"
-    Lam e -> VLam (\v -> eval (v : ctxt) e)
-    
-type Context = [(Name, Value)]
+    Lam n e ->
+      Lam n (runIdentity $ transverseScope (Identity . eval) e)
+    _ -> expr
 
-check :: Int -> Context -> Expr -> Value -> Either TypeError ()
-check binders ctxt expr ty
-  | Lam e <- expr =
+printExpr :: Expr String String -> String
+printExpr e =
+  case e of
+    Ann a b -> "(" ++ printExpr a ++ ") : (" ++ printExpr b ++ ")"
+    Type -> "Type"
+    Pi n a b ->
+      "pi (" ++ n ++ " : " ++ printExpr a ++ "). " ++
+      printExpr (instantiate1Name (Var n) b)
+    Var a -> a
+    App a b -> "(" ++ printExpr a ++ ") (" ++ printExpr b ++ ")"
+    Lam n a ->
+      "lam " ++ n ++ ". " ++ printExpr (instantiate1Name (Var n) a)
+
+data TypeError n a
+  = TypeMismatch (Expr n a) (Expr n a)
+  | NotAFunction (Expr n a)
+  | NotAFunctionType (Expr n a)
+  | CannotInfer (Expr n a)
+  | UnknownVar n
+  deriving (Eq, Show)
+
+type Context n = [(n, Expr n n)]
+
+-- | Check the first argument's type is the second argument. The second argument is
+-- | assumed to be in normal form.
+check :: (Show n, Eq n) => Context n -> Expr n n -> Expr n n -> Either (TypeError n n) ()
+check ctxt expr ty
+  | Lam x e <- expr =
       case ty of
-        VPi tau tau' ->
+        Pi n tau tau' ->
           check
-            (binders+1)
-            ((Local binders, tau) : ctxt)
-            (subst 0 (Free $ Local binders) e)
-            (tau' . VNeutral $ NVar $ Local binders)
-        _ -> Left $ NotAFunctionType $ quote 0 ty
+            ((x, tau) : (n, tau) : ctxt)
+            (instantiate1 (Var x) e)
+            (instantiate1 (Var n) tau')
+        _ -> Left $ NotAFunctionType ty
   | otherwise = do
-      ty' <- infer binders ctxt expr
-      let
-        v = quote 0 ty
-        v' = quote 0 ty'
-      unless (v == v') . Left $ TypeMismatch v v'
-
--- | Substitute first into second
-subst :: Int -> Expr -> Expr -> Expr
-subst binder new orig
-  | binder < 0 = error "subst: called with binder less than 0"
-  | otherwise =
-      case orig of
-        Ann e t -> Ann (subst binder new e) t
-        Type -> Type
-        Pi t e -> Pi (subst binder new t) (subst (binder+1) new e)
-        Bound n -> if binder == n then new else orig
-        App f x -> App (subst binder new f) (subst binder new x)
-        Lam e -> Lam (subst (binder+1) new e)
-        Free a -> Free a
-
-infer :: Int -> Context -> Expr -> Either TypeError Value
-infer binders ctxt expr =
+      ty' <- infer ctxt expr
+      unless (ty == ty') . Left $ TypeMismatch ty ty'
+      
+infer :: (Show n, Eq n) => Context n -> Expr n n -> Either (TypeError n n) (Expr n n)
+infer ctxt expr =
   case expr of
     Ann e rho -> do
-      check binders ctxt rho VType
-      let tau = eval [] rho
-      check binders ctxt e tau
+      check ctxt rho Type
+      let tau = eval rho
+      check ctxt e tau
       pure tau
-    Type -> pure VType
-    Pi rho rho' -> do
-      check binders ctxt rho VType
-      let tau = eval [] rho
+    Type -> pure Type
+    Pi n rho rho' -> do
+      check ctxt rho Type
+      let tau = eval rho
       check
-        (binders+1)
-        ((Local binders, tau) : ctxt)
-        (subst 0 (Free $ Local binders) rho')
-        VType
-      pure VType
-    Free name ->
-      case lookup name ctxt of
-        Just v -> pure v
-        Nothing -> Left $ UnknownName name
-    Bound a -> error $ "infer: unexpected " ++ show a
+        ((n, tau) : ctxt)
+        (instantiate1 (Var n) rho')
+        Type
+      pure Type
     App f x -> do
-      tf <- infer binders ctxt f
+      tf <- infer ctxt f
       case tf of
-        VPi tau tau' -> do
-          check binders ctxt x tau
-          pure $ tau' (eval [] x)
-        _ -> Left $ NotAFunction f $ quote 0 tf
+        Pi _ tau tau' -> do
+          check ctxt x tau
+          pure $ instantiate1 x tau'
+        _ -> Left $ NotAFunction (Ann f tf)
+    Var n ->
+      case lookup n ctxt of
+        Just tau -> pure tau
+        Nothing -> Left $ UnknownVar n
     _ -> Left $ CannotInfer expr
