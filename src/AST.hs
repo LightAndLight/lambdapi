@@ -1,4 +1,4 @@
-{-# language DeriveFunctor, DeriveFoldable, DeriveTraversable, TemplateHaskell, FlexibleContexts #-}
+{-# language DeriveFunctor, DeriveFoldable, DeriveTraversable, TemplateHaskell, FlexibleContexts, ApplicativeDo #-}
 module AST where
 
 import Bound
@@ -11,6 +11,51 @@ import Data.Deriving
 import Data.Functor.Classes
 import Data.Functor.Identity
 import Text.Trifecta
+
+expr :: (Eq n, DeltaParsing m) => m n -> m (Expr n n)
+expr ns =
+  pi <|>
+  lam <|>
+  try app <|>
+  try ann <|>
+  var <|>
+  between (symbol "(") (symbol ")") (token $ expr ns)
+  where
+    appRhs =
+      between (symbol "(") (symbol ")") (token $ lam <|> try app <|> pi <|> ann) <|>
+      token var
+    appLhs =
+      between (symbol "(") (symbol ")") (token $ lam <|> try ann <|> app) <|>
+      token var
+    app = do
+      l <- appLhs
+      rs <- some appRhs
+      pure $ foldl App l rs
+
+    annLhs =
+      between (symbol "(") (symbol ")") (token $ lam <|> ann <|> try app) <|>
+      token var
+    annRhs =
+      between (symbol "(") (symbol ")") ann <|>
+      token (try app) <|>
+      token lam <|>
+      token var
+    ann = Ann <$> (annLhs <* symbol ":") <*> annRhs
+
+    var = Var <$> token ns
+    pi = do
+      _ <- symbol "pi"
+      (n, f) <- between (symbol "(") (symbol ")") $ do
+        n <- token ns
+        _ <- symbol ":"
+        pure (n, Pi n <$> token (expr ns))
+      _ <- symbol "."
+      f <*> (abstract1Name n <$> token (expr ns))
+    lam = do
+      _ <- symbol "lam"
+      n <- token ns
+      _ <- symbol "."
+      Lam n . abstract1Name n <$> token (expr ns)
 
 -- | Type : Type is unsound and needs to be reworked with universe polymorphism
 data Expr n a
@@ -100,7 +145,7 @@ type Context n = [(n, Expr n n)]
 
 -- | Check the first argument's type is the second argument. The second argument is
 -- | assumed to be in normal form.
-check :: (Show n, Eq n) => Context n -> Expr n n -> Expr n n -> Either (TypeError n n) ()
+check :: Eq n => Context n -> Expr n n -> Expr n n -> Either (TypeError n n) ()
 check ctxt expr ty
   | Lam x e <- expr =
       case ty of
@@ -114,7 +159,7 @@ check ctxt expr ty
       ty' <- infer ctxt expr
       unless (ty == ty') . Left $ TypeMismatch ty ty'
       
-infer :: (Show n, Eq n) => Context n -> Expr n n -> Either (TypeError n n) (Expr n n)
+infer :: Eq n => Context n -> Expr n n -> Either (TypeError n n) (Expr n n)
 infer ctxt expr =
   case expr of
     Ann e rho -> do
