@@ -1,12 +1,12 @@
-{ mkDerivation, base, bound, deriving-compat, parsers
-, recursion-schemes, stdenv, transformers, trifecta
+{ mkDerivation, base, bound, containers, deriving-compat, lens, mtl
+, parsers, stdenv, transformers, trifecta
 }:
 mkDerivation {
   pname = "lambdapi";
   version = "0.1.0.0";
   src = ./.;
   libraryHaskellDepends = [
-    base bound deriving-compat parsers recursion-schemes transformers
+    base bound containers deriving-compat lens mtl parsers transformers
     trifecta
   ];
   license = stdenv.lib.licenses.bsd3;

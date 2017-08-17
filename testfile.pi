@@ -1,0 +1,4 @@
+%%syntax expr { testSyntax = Discard (Symbol "test") (Pure 'Test) }
+
+id : pi (t : Type). pi (a : t). t
+id = test test

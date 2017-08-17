@@ -16,15 +16,17 @@ extra-source-files:  ChangeLog.md
 cabal-version:       >=1.10
 
 library
-  exposed-modules:     AST
+  exposed-modules:     Syntax, Expr, Decl, Module, Eval, Typecheck
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base >=4.9 && <4.10
-                     , trifecta
+                     , trifecta >=1.7 && <1.8
+                     , containers >=0.5.9.1 && <0.6
                      , parsers
                      , transformers
                      , deriving-compat
-                     , recursion-schemes
                      , bound
+                     , mtl
+                     , lens >=4.15.2 && <4.16
   hs-source-dirs:      src
   default-language:    Haskell2010
