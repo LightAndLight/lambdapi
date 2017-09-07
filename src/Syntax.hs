@@ -3,7 +3,6 @@
 {-# language GADTs #-}
 {-# language GeneralizedNewtypeDeriving #-}
 module Syntax where
-import Debug.Trace
 
 import Bound
 import Bound.Name
@@ -24,6 +23,14 @@ import Eval
 import Expr
 import Decl
 import Module
+
+parseModule :: String -> Result Module
+parseModule =
+  let parser =
+        flip evalStateT defaultSyntaxRules .
+        unSyntax $
+        module'
+  in parseString parser mempty
 
 sccRFromMap :: Ord k => Map k (n, [k]) -> [SCC (n, k, [k])]
 sccRFromMap = stronglyConnCompR . fmap (\(k, (n, ks)) -> (n, k, ks)) . M.toList
@@ -75,7 +82,7 @@ buildGrammar [e] =
     (CyclicSCC ((ex, _, _) : _)) -> pure ex
 buildGrammar (a:rest) =
   liftA2 (<|>) (buildGrammar rest) (buildGrammar [a])
-  
+
 addRule :: (Alternative m, MonadState SyntaxRules m) => SCC (Expr, String, [String]) -> m ()
 addRule e =
   case e of
@@ -88,23 +95,6 @@ addRule e =
       let vs' = substituteMutually reifyExprSyntax ctxt $ (\(a, b, _) -> (b, a)) <$> vs
       let deps = M.elems . M.fromList $ (\(_, b, c) -> (b, c)) <$> vs
       modify $ \s -> s { exprRules = M.fromList (zipWith (\(a, b) c -> (a, (b, c))) (M.toList vs') deps) `M.union` exprRules s }
-
-        {-
-buildGrammar sccs =
-  case sccs of
-    (AcyclicSCC (ex, n, deps):rest) -> do
-      ctxt <- gets (fmap fst . exprRules)
-      let ex' = reifyExprSyntax ctxt ex
-      modify $ \s -> s { exprRules = M.insert n (ex', deps) $ exprRules s }
-      fmap (<|> ex') (buildGrammar rest)
-    (CyclicSCC vs:rest) -> do
-      ctxt <- gets (fmap fst . exprRules)
-      let vs' = substituteMutually reifyExprSyntax ctxt $ (\(a, b, _) -> (b, a)) <$> vs
-      let deps = M.elems . M.fromList $ (\(_, b, c) -> (b, c)) <$> vs
-      modify $ \s -> s { exprRules = M.fromList (zipWith (\(a, b) c -> (a, (b, c))) (M.toList vs') deps) `M.union` exprRules s }
-      case vs of
-        [] -> buildGrammar rest
-        ((_, n, _):_) -> fmap (<|> fromJust (M.lookup n vs')) (buildGrammar rest) -}
 
 data SyntaxRules
   = SyntaxRules
@@ -231,11 +221,19 @@ module' = do
 identifier :: Syntax String
 identifier = token (liftA2 (:) lower $ many letter)
 
-buildDefaultGrammar :: Syntax ()
-buildDefaultGrammar = do
-  grammar <-
-    go (sccRFromMap defaultExprRules)
-  modify $ \s -> s { exprGrammar = grammar }
+defaultSyntaxRules :: SyntaxRules
+defaultSyntaxRules =
+  SyntaxRules
+  { exprGrammar = defaultGrammar
+  , exprRules = defaultExprRules
+  , declRules = defaultDeclRules
+  , moduleRules = defaultModuleRules
+  }
+
+defaultGrammar :: Syntax Expr
+defaultGrammar = do
+  grammar <- go (sccRFromMap defaultExprRules)
+  grammar
   where
     go
       :: MonadState SyntaxRules m
