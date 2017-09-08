@@ -1,4 +1,4 @@
-%%syntax expr { testSyntax = Discard (Symbol "test") (Pure 'Test) }
+%%syntax expr { testSyntax = Try (Bind (Symbol "test") (lam a. Pure 'Test)) }
 
 id : pi (t : Type). pi (a : t). t
 id = test test

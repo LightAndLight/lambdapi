@@ -86,6 +86,16 @@ _Pi =
     (\case
         Pi n t t' -> Just (n, t, instantiate1 (Var n) t')
         _ -> Nothing)
+    
+_Pi'
+  :: Eq a
+  => Prism' (ExprF a a) (a, ExprF a a, Scope (Name a ()) (ExprF a) a)
+_Pi' =
+  prism'
+    (\(n, t, t') -> Pi n t t')
+    (\case
+        Pi n t t' -> Just (n, t, t')
+        _ -> Nothing)
 
 _Ann :: Prism' (ExprF a a) (ExprF a a, ExprF a a)
 _Ann =

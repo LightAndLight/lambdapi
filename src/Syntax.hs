@@ -1,3 +1,4 @@
+{-# language DeriveFunctor #-}
 {-# language FlexibleContexts #-}
 {-# language FlexibleInstances #-}
 {-# language GADTs #-}
@@ -7,10 +8,10 @@ module Syntax where
 import Bound
 import Bound.Name
 import Control.Applicative
-import Control.Arrow
 import Control.Lens hiding (Empty)
 import Control.Monad.State
 import Data.Foldable
+import Data.Functor
 import Data.Graph
 import Data.Map (Map)
 import Data.Maybe
@@ -29,7 +30,7 @@ parseModule =
   let parser =
         flip evalStateT defaultSyntaxRules .
         unSyntax $
-        module'
+        buildParser =<< module'
   in parseString parser mempty
 
 sccRFromMap :: Ord k => Map k (n, [k]) -> [SCC (n, k, [k])]
@@ -71,37 +72,11 @@ substituteMutually f = go M.empty
         result' = go result ctxt' rest
       in M.insert n ex' result'
 
--- | Given a list of strongly connected compoents (of type Syntax Expr) in topological order,
--- | reify them in order.
-buildGrammar :: Alternative m => [SCC (Syntax Expr, String, [String])] -> m (Syntax Expr)
-buildGrammar [] = empty
-buildGrammar [e] =
-  case e of
-    (AcyclicSCC (ex, _, _)) -> pure ex
-    (CyclicSCC []) -> error "no elements in cyclic scc"
-    (CyclicSCC ((ex, _, _) : _)) -> pure ex
-buildGrammar (a:rest) =
-  liftA2 (<|>) (buildGrammar rest) (buildGrammar [a])
-
-addRule :: (Alternative m, MonadState SyntaxRules m) => SCC (Expr, String, [String]) -> m ()
-addRule e =
-  case e of
-    (AcyclicSCC (ex, n, deps)) -> do
-      ctxt <- gets (fmap fst . exprRules)
-      let ex' = reifyExprSyntax ctxt ex
-      modify $ \s -> s { exprRules = M.insert n (ex', deps) $ exprRules s }
-    (CyclicSCC vs) -> do
-      ctxt <- gets (fmap fst . exprRules)
-      let vs' = substituteMutually reifyExprSyntax ctxt $ (\(a, b, _) -> (b, a)) <$> vs
-      let deps = M.elems . M.fromList $ (\(_, b, c) -> (b, c)) <$> vs
-      modify $ \s -> s { exprRules = M.fromList (zipWith (\(a, b) c -> (a, (b, c))) (M.toList vs') deps) `M.union` exprRules s }
-
 data SyntaxRules
   = SyntaxRules
-  { exprGrammar :: Syntax Expr
-  , exprRules :: Map String (Syntax Expr, [String])
-  , declRules :: Map String (Syntax Decl, [String])
-  , moduleRules :: Map String (Syntax Module, [String])
+  { exprRules :: [ParseProgram Expr -> ParseProgram Expr]
+  , declRules :: [ParseProgram Decl -> ParseProgram Expr -> ParseProgram Decl]
+  , moduleRules :: [ParseProgram Module -> ParseProgram Decl -> ParseProgram Module]
   }
 
 newtype Syntax a
@@ -116,50 +91,110 @@ newtype Syntax a
 instance TokenParsing Syntax where
   someSpace = skipSome $ satisfy (`elem` " \t")
 
-liftParser :: Parser a -> Syntax a
-liftParser = Syntax . lift
+reifyFunction :: HasCallStack => Expr -> (Expr -> Expr)
+reifyFunction =
+  outside _Lam'
+    .~ (\(_, e) ex -> eval $ instantiate1 ex e) $
+  outside _Pi'
+    .~ (\(_, _, e) ex -> eval $ instantiate1 ex e) $
+
+  (error . ("Non-function passed to reifyFunction: " ++) . show)
+
+isUnit :: HasCallStack => Expr -> Expr
+isUnit =
+  outside (_Con0 "Unit") .~ const (Ctor "Unit") $
+  (error . ("Unit was not passed to reifyUnit: " ++) . show)
 
 -- | Assumes that the AST is well-formed and has type `Syntax Expr`
-reifyExprSyntax :: HasCallStack => Map String (Syntax Expr) -> Expr -> Syntax Expr
+reifyExprSyntax
+  :: HasCallStack
+  => Map String (ParseProgram Expr)
+  -> Expr
+  -> ParseProgram Expr
 reifyExprSyntax ctxt e = go1 $ eval e
   where
-    go1 :: HasCallStack => Expr -> Syntax Expr
+
+    go1 :: HasCallStack => Expr -> ParseProgram Expr
     go1 =
       outside _Var
         .~ (\n -> fromMaybe (error "name not found") $ M.lookup n ctxt) $
+
       outside (_Con1 "Pure")
-        .~ (pure . eval) $
+        .~ Pure . eval $
 
       outside (_Con2 "Bind")
-        .~ (\(sa, f) -> go2 sa >>= go2 . eval . App f) $
+        .~ (\(ma, f) ->
+              Bind (go2 ma) (\a -> go2 . eval . App f $ _Quoted # a)) $
 
       outside (_Con2 "Map")
-        .~ (\(f, sa) -> eval . App f <$> go2 sa) $
+        .~ (\(f, ma) -> Map (\a -> eval . App f $ _Quoted # a) $ go2 ma) $
 
-      outside (_Con2 "Discard")
-        .~ (\(sa, sb) -> go2 sa >> go2 sb) $
+      outside (_Con2 "Choice")
+        .~ (\(ma, ma') -> Choice (go2 ma) $ go2 ma') $
+
+      outside (_Con0 "Empty")
+        .~ const Empty $
+
+      outside (_Con2 "Apply")
+        .~ (\(mf, ma) -> Apply (reifyFunction <$> go2 mf) $ go2 ma) $
+
+      outside (_Con1 "Try")
+        .~ (Try . go2) $
+
+      outside (_Con2 "Named" . _Mk2 id _String)
+        .~ (\(ma, s) -> Named (go2 ma) s) $
+
+      outside (_Con1 "Unexpected" . _String)
+        .~ Unexpected $
 
       error . ("invalid argument: "++) . show
 
-    go2 :: HasCallStack => Expr -> Syntax Expr
+    go2 :: HasCallStack => Expr -> ParseProgram Expr
     go2 =
-      outside (_Con1 "Symbol"._String) .~ (fmap String . symbol) $
+      outside (_Con1 "NotFollowedBy")
+        .~ (\ma -> isUnit <$> go2 ma) $
+
+      outside (_Con0 "SomeSpace")
+        .~ (\_ -> SomeSpace $> Ctor "Unit") $
+
+      outside (_Con1 "Symbol" . _String)
+        .~ (\s -> Symbol s $> String s) $
+
+      outside (_Con0 "Eof")
+        .~ const (Eof $> Ctor "Unit")$
+
       outside (_Con1 "Satisfy"._Lam') .~ (\(_, body) ->
         fmap Char . satisfy $
           \a -> case eval $ instantiate1 (Char a) body of
             Ctor "True" -> True
             Ctor "False" -> False
             res -> error $ "invalid result: " ++ show res) $
+
       go1
 
-reifyDeclSyntax :: HasCallStack => Expr -> Syntax Decl
+reifyDeclSyntax :: HasCallStack => Expr -> ParseProgram Decl
 reifyDeclSyntax = undefined
 
-reifyModuleSyntax :: HasCallStack => Expr -> Syntax Module
+reifyModuleSyntax :: HasCallStack => Expr -> ParseProgram Module
 reifyModuleSyntax = undefined
 
-expr :: Syntax Expr
-expr = join $ gets exprGrammar
+buildParser :: (Monad m, TokenParsing m) => ParseProgram a -> m a
+buildParser p =
+  case p of
+    Choice a1 a2 -> buildParser a1 <|> buildParser a2
+    Empty -> empty
+    Pure a -> pure a
+    Map f a -> f <$> buildParser a
+    Apply a1 a2 -> buildParser a1 <*> buildParser a2
+    Bind a1 a2 -> buildParser a1 >>= buildParser . a2
+    Try a -> try $ buildParser a
+    Named a1 a2 -> buildParser a1 <?> a2
+    NotFollowedBy a -> notFollowedBy $ buildParser a
+    Unexpected a -> unexpected a
+    Eof -> eof
+    Satisfy a -> satisfy a
+    Symbol s -> symbol s
+    SomeSpace -> someSpace
 
 syntax :: Syntax ()
 syntax = syntaxExpr <|> syntaxDecl <|> syntaxModule
@@ -168,286 +203,216 @@ syntax = syntaxExpr <|> syntaxDecl <|> syntaxModule
       _ <- symbol "%%syntax expr"
       es <- braces $
         sepEndBy1
-          (liftA2 (,) identifier $ symbol "=" *> token expr)
+          (liftA2
+             (,)
+             (token identifier)
+             (symbol "=" *> token (expr >>= buildParser)))
           newline
       let
-        deps = es ^..
-          folded .
-          alongside id (to $ id &&& (^.. cosmos._Var))
-      traverse_ addRule (sccRFromMap $ M.fromList deps)
-      rules <- gets exprRules
-      grammar <- buildGrammar (sccRFromMap rules) 
-      modify $ \s -> s { exprGrammar = grammar }
+        substituted =
+          substituteMutually
+            (\m b -> fromMaybe b $ (b ^? _Var) >>= flip M.lookup m)
+            M.empty
+            es
+        reified = reifyExprSyntax M.empty <$> toList substituted
+      modify $ \s -> s { exprRules = exprRules s ++ fmap const reified }
 
     syntaxDecl = do
       _ <- symbol "%%syntax decl"
       es <- braces $
         sepEndBy1
-          (liftA2 (,) identifier $ symbol "=" *> token expr)
+          (liftA2
+            (,)
+            identifier
+            (symbol "=" *> token (expr >>= buildParser)))
           newline
       let
-        deps = es ^..
-          folded .
-          alongside id (to $ reifyDeclSyntax &&& (^.. cosmos._Var))
-
+        substituted =
+          substituteMutually
+            (\m b -> fromMaybe b $ (b ^? _Var) >>= flip M.lookup m)
+            M.empty
+            es
+        reified = reifyDeclSyntax <$> toList substituted
       modify $
-        \s -> s { declRules = M.fromList deps `M.union` declRules s }
+        \s -> s { declRules = fmap (const . const) reified ++ declRules s }
 
     syntaxModule = do
       _ <- symbol "%%syntax module"
       es <- braces $
         sepEndBy1
-          (liftA2 (,) identifier $ symbol "=" *> token expr)
+          (liftA2
+            (,)
+            identifier
+            (symbol "=" *> token (expr >>= buildParser)))
           newline
       let
-        deps = es ^..
-          folded .
-          alongside id (to $ reifyModuleSyntax &&& (^.. cosmos._Var))
-
+        substituted =
+          substituteMutually
+            (\m b -> fromMaybe b $ (b ^? _Var) >>= flip M.lookup m)
+            M.empty
+            es
+        reified = reifyModuleSyntax <$> toList substituted
       modify $
-        \s -> s { moduleRules = M.fromList deps `M.union` moduleRules s }
+        \s -> s { moduleRules = fmap (const . const) reified ++ moduleRules s }
 
-decl :: Syntax Decl
-decl =
-  (token syntax *> some newline *> decl) <|> (do
-    rules <- gets (choice . toListOf (folded._1) . declRules)
-    (rules <* many newline))
+expr :: Syntax (ParseProgram Expr)
+expr = do
+  rules <- gets exprRules
+  let e = asum $ fmap ($ e) rules
+  pure e
 
-module' :: Syntax Module
-module' = do
-  rules <- gets (choice . toListOf (folded._1) . moduleRules)
-  (syntax *> many newline *> module') <|> rules
+decl :: Syntax (ParseProgram Decl)
+decl = someSyntax <|> aDecl
+  where
+    someSyntax = token syntax *> some newline *> decl
+    aDecl = do
+      ds <- gets declRules
+      e <- expr
 
-identifier :: Syntax String
+      let d = asum $ fmap (($ e) . ($ d)) ds
+      pure d
+
+module' :: Syntax (ParseProgram Module)
+module' = someSyntax <|> aModule
+  where
+    someSyntax = token syntax *> some newline *> module'
+    aModule = do
+      ms <- gets moduleRules
+      d <- decl
+
+      let m = asum $ fmap (($ d) . ($ m)) ms
+      pure m
+
+identifier :: TokenParsing m => m String
 identifier = token (liftA2 (:) lower $ many letter)
 
 defaultSyntaxRules :: SyntaxRules
 defaultSyntaxRules =
   SyntaxRules
-  { exprGrammar = defaultGrammar
-  , exprRules = defaultExprRules
+  { exprRules = defaultExprRules
   , declRules = defaultDeclRules
   , moduleRules = defaultModuleRules
   }
 
-defaultGrammar :: Syntax Expr
-defaultGrammar = do
-  grammar <- go (sccRFromMap defaultExprRules)
-  grammar
-  where
-    go
-      :: MonadState SyntaxRules m
-      => [SCC (Syntax Expr, String, [String])] -> m (Syntax Expr)
-    go [] = pure empty
-    go (AcyclicSCC (e, name, deps) : rest) = do
-      modify $ \s -> s { exprRules = M.insert name (e, deps) $ exprRules s }
-      fmap (<|> e) $ go rest
-    go (CyclicSCC [] : rest) = go rest
-    go (CyclicSCC vs : rest) = do
-      modify $ \s -> s { exprRules =
-        M.union (M.fromList $ (\(a, b, c) -> (b, (a, c))) <$> vs) $ exprRules s }
-      case vs of
-        [] -> go rest
-        ((e, _, _) : _) -> fmap (<|> e) $ go rest
+data ParseProgram a where
+  Choice :: ParseProgram a -> ParseProgram a -> ParseProgram a
+  Empty :: ParseProgram a
+  Pure :: a -> ParseProgram a
+  Map :: (a -> b) -> ParseProgram a -> ParseProgram b
+  Apply :: ParseProgram (a -> b) -> ParseProgram a -> ParseProgram b
+  Bind :: ParseProgram a -> (a -> ParseProgram b) -> ParseProgram b
+  Try :: ParseProgram a -> ParseProgram a
+  Named :: ParseProgram a -> String -> ParseProgram a
+  NotFollowedBy :: Show a => ParseProgram a -> ParseProgram ()
+  Unexpected :: String -> ParseProgram a
+  Eof :: ParseProgram ()
+  Satisfy :: (Char -> Bool) -> ParseProgram Char
+  Symbol :: String -> ParseProgram String
+  SomeSpace :: ParseProgram ()
 
-defaultExprRules :: Map String (Syntax Expr, [String])
-defaultExprRules =
-  M.fromList
-    [ ( "__exprStart_internal"
-      , ( exprStart
-        , [ "__pi_internal"
-          , "__lam_internal"
-          , "__quote_internal"
-          , "__ann_internal"
-          , "__app_internal"
-          , "__lit_internal"
-          , "__var_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ("__pi_internal", (pi, ["__annRhs_internal"]))
-    , ( "__annRhs_internal"
-      , ( annRhs
-        , [ "__lam_internal"
-          , "__ann_internal"
-          , "__app_internal"
-          , "__quote_internal"
-          , "__var_internal"
-          , "__lit_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ("__lam_internal", (lam, []))
-    , ("__app_internal", (try app, ["__appLhs_internal", "__appRhs_internal"]))
-    , ( "__appLhs_internal"
-      , ( appLhs
-        , [ "__quote_internal"
-          , "__var_internal"
-          , "__lit_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ( "__appRhs_internal"
-      , ( appRhs
-        , [ "__quote_internal"
-          , "__var_internal"
-          , "__lit_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ( "__ann_internal"
-      , ( try ann
-        , [ "__annLhs_internal"
-          , "__annRhs_internal"
-          ]
-        )
-      )
-    , ( "__annLhs_internal"
-      , ( annLhs
-        , [ "__lam_internal"
-          , "__ann_internal"
-          , "__app_internal"
-          , "__quote_internal"
-          , "__var_internal"
-          , "__lit_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ( "__annRhs_internal"
-      , ( annRhs
-        , [ "__ann_internal"
-          , "__app_internal"
-          , "__quote_internal"
-          , "__lam_internal"
-          , "__lit_internal"
-          , "__var_internal"
-          , "__ctor_internal"
-          ]
-        )
-      )
-    , ( "__quote_internal"
-      , ( quote
-        , [ "__quote_internal"
-          , "__var_internal"
-          , "__ctor_internal"
-          , "__lit_internal"
-          , "__pi_internal"
-          , "__lam_internal"
-          , "__app_internal"
-          , "__ann_internal"
-          ]
-        )
-      )
-    , ("__var_internal", (var, []))
-    , ("__ctor_internal", (ctor, []))
-    , ("__lit_internal", (lit, []))
-    , ("__bracketed_internal", (between (symbol "(") (symbol ")") (token expr), []))
-    ]
+instance Functor ParseProgram where
+  fmap = Map
+
+instance Applicative ParseProgram where
+  pure = Pure
+  (<*>) = Apply
+
+instance Alternative ParseProgram where
+  empty = Empty
+  (<|>) = Choice
+
+instance Monad ParseProgram where
+  (>>=) = Bind
+
+instance Parsing ParseProgram where
+  try = Try
+  (<?>) = Named
+  notFollowedBy = NotFollowedBy
+  unexpected = Unexpected
+  eof = Eof
+
+instance CharParsing ParseProgram where
+  satisfy = Satisfy
+
+instance TokenParsing ParseProgram where
+  someSpace = SomeSpace
+
+defaultExprRules :: [ParseProgram Expr -> ParseProgram Expr]
+defaultExprRules = [ exprStart ]
   where
-    exprStart =
-      pi <|>
-      lam <|>
-      quote <|>
-      parens expr <|>
-      try ann <|>
-      try app <|>
-      lit <|>
-      var <|>
-      ctor
-      
+    exprStart :: ParseProgram Expr -> ParseProgram Expr
+    exprStart es =
+      pi es <|>
+      lam es <|>
+      try (ann es) <|>
+      try (app es) <|>
+      atom es
+
+    var :: ParseProgram Expr
     var = Var <$> identifier
-    quote = do
+
+    quote :: ParseProgram Expr -> ParseProgram Expr
+    quote es = do
       _ <- try $ char '\''
-      fmap Quote $
-        quote <|>
-        var <|>
-        ctor <|>
-        lit <|>
-        between (char '(') (char ')')
-          (pi <|>
-          lam <|>
-          try app <|>
-          try ann)
+      Quote <$> atom es
 
-    appRhs =
-      between (symbol "(") (symbol ")") (token expr) <|> -- (token $ lam <|> try app <|> pi <|> ann) <|>
-      quote <|>
+    atom :: ParseProgram Expr -> ParseProgram Expr
+    atom es =
+      between (symbol "(") (symbol ")") (token es) <|>
+      quote es <|>
       var <|>
       lit <|>
       ctor
 
-    appLhs =
-      between (symbol "(") (symbol ")") (token expr) <|> -- (token $ lam <|> try ann <|> app) <|>
-      quote <|>
-      var <|>
-      lit <|>
-      ctor
+    app :: ParseProgram Expr -> ParseProgram Expr
+    app es = chainl1 (token $ atom es) (pure App)
 
-    app = do
-      l <- token appLhs
-      rs <- some $ token appRhs
-      pure $ foldl App l rs
+    ann :: ParseProgram Expr -> ParseProgram Expr
+    ann es =
+      Ann <$>
+      (token (atom es) <* symbol ":") <*>
+      token (try (app es) <|> atom es)
 
-    annLhs =
-      between (symbol "(") (symbol ")") (token $ lam <|> ann <|> try app) <|>
-      quote <|>
-      var <|>
-      lit <|>
-      ctor
-
-    annRhs =
-      between (symbol "(") (symbol ")") (token ann) <|>
-      try app <|>
-      quote <|>
-      lam <|>
-      var <|>
-      lit <|>
-      ctor
-
-    ann = Ann <$> (token annLhs <* symbol ":") <*> token annRhs
-
+    ctor :: ParseProgram Expr
     ctor = Ctor <$> token (liftA2 (:) upper $ many letter)
 
+    lit :: ParseProgram Expr
     lit =
       (Char <$> try charLiteral) <|>
       (String <$> stringLiteral)
 
-    pi = do
+    pi :: ParseProgram Expr -> ParseProgram Expr
+    pi es = do
       _ <- symbol "pi"
       (n, f) <- token . between (symbol "(") (symbol ")") $ do
         n <- token $ some letter
         _ <- symbol ":"
-        (,) n . Pi n <$> token annRhs
+        (,) n . Pi n <$> token (atom es)
       _ <- symbol "."
-      f . abstract1Name n <$> token expr
+      f . abstract1Name n <$> token es
 
-    lam = do
+    lam :: ParseProgram Expr -> ParseProgram Expr
+    lam es = do
       _ <- symbol "lam"
       n <- token $ some letter
       _ <- symbol "."
-      Lam n . abstract1Name n <$> token expr
+      Lam n . abstract1Name n <$> token es
 
-defaultDeclRules :: Map String (Syntax Decl, [String])
-defaultDeclRules =
-  M.fromList 
-  [ ("__decl_internal", (decl, [])) ]
+defaultDeclRules
+  :: [ParseProgram Decl -> ParseProgram Expr -> ParseProgram Decl]
+defaultDeclRules = [ declStart ]
   where
-    decl = do
+    declStart _ es = do
       n <- token $ liftA2 (:) lower (many letter)
       _ <- symbol ":"
-      ty <- token expr
+      ty <- token es
       _ <- newline
       _ <- symbol n
       _ <- symbol "="
-      val <- token expr
+      val <- token es
       pure $ DeclBinding n val ty
 
-defaultModuleRules :: Map String (Syntax Module, [String])
+defaultModuleRules
+  :: [ParseProgram Module -> ParseProgram Decl -> ParseProgram Module]
 defaultModuleRules =
-  M.fromList
-  [ ("__module_internal", (Module <$> sepEndBy1 decl (some newline), [])) ]
+  [ \ms ds -> Module <$> sepEndBy1 ds (some newline) ]
